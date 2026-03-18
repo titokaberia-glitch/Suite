@@ -1,24 +1,29 @@
-import Database from 'better-sqlite3';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { createClient } from '@libsql/client';
+import dotenv from 'dotenv';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+dotenv.config();
 
-const db = new Database('hotel.db');
+// Initialize Turso client
+// If URL and Auth Token are not provided, it falls back to a local file for development
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:hotel.db',
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
-// Enable foreign keys
-db.pragma('foreign_keys = ON');
-
-// Initialize tables
-export function initDb() {
-  db.exec(`
+// Helper function to execute queries synchronously-like (since Turso is async)
+// We will need to update server.ts to use async/await for db calls.
+export async function initDb() {
+  await db.executeMultiple(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
       password TEXT NOT NULL,
       role TEXT NOT NULL CHECK(role IN ('admin', 'receptionist', 'waiter', 'manager')),
-      name TEXT NOT NULL
+      name TEXT NOT NULL,
+      salary REAL DEFAULT 0,
+      allowances REAL DEFAULT 0,
+      deductions REAL DEFAULT 0,
+      status TEXT DEFAULT 'active'
     );
 
     CREATE TABLE IF NOT EXISTS rooms (
@@ -175,48 +180,6 @@ export function initDb() {
       FOREIGN KEY (item_id) REFERENCES pay_item_types(id)
     );
   `);
-
-  // Migration: Add breakdown to payroll if it doesn't exist
-  const payrollTableInfo = db.prepare("PRAGMA table_info(payroll)").all() as any[];
-  if (!payrollTableInfo.some(col => col.name === 'breakdown')) {
-    try {
-      db.exec("ALTER TABLE payroll ADD COLUMN breakdown TEXT");
-    } catch (e) {
-      console.error("Migration failed: breakdown column", e);
-    }
-  }
-
-  // Migration: Add fulfillment_status to orders if it doesn't exist
-  const tableInfo = db.prepare("PRAGMA table_info(orders)").all() as any[];
-  const hasFulfillmentStatus = tableInfo.some(col => col.name === 'fulfillment_status');
-  if (!hasFulfillmentStatus) {
-    try {
-      db.exec("ALTER TABLE orders ADD COLUMN fulfillment_status TEXT NOT NULL DEFAULT 'pending' CHECK(fulfillment_status IN ('pending', 'fulfilled', 'delivered'))");
-    } catch (e) {
-      console.error("Migration failed: fulfillment_status already exists or error adding it", e);
-    }
-  }
-
-  // Migration: Add salary, allowances, deductions to users
-  const usersTableInfo = db.prepare("PRAGMA table_info(users)").all() as any[];
-  if (!usersTableInfo.some(col => col.name === 'salary')) {
-    try {
-      db.exec("ALTER TABLE users ADD COLUMN salary REAL DEFAULT 0");
-      db.exec("ALTER TABLE users ADD COLUMN allowances REAL DEFAULT 0");
-      db.exec("ALTER TABLE users ADD COLUMN deductions REAL DEFAULT 0");
-      db.exec("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'");
-    } catch (e) {
-      console.error("Migration failed for users table", e);
-    }
-  }
-
-  // Seed admin user if not exists
-  const admin = db.prepare('SELECT * FROM users WHERE username = ?').get('admin');
-  if (!admin) {
-    // Password is 'admin123' - in a real app we'd hash it, but let's do it in the seed logic
-    // Actually, I'll use bcrypt here since I installed it.
-    // Wait, I can't use async here easily in db.exec. I'll do it in server.ts init.
-  }
 }
 
 export default db;

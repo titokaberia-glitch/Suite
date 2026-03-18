@@ -24,6 +24,7 @@ async function request(path: string, options: RequestInit = {}) {
     } catch (e) {
       // If response is not JSON, use status text
       errorMessage = response.statusText || errorMessage;
+      console.error(`API Error (${response.status}) at ${path}:`, errorMessage);
     }
     throw new Error(errorMessage);
   }

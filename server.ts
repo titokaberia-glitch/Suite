@@ -22,25 +22,31 @@ async function startServer() {
   });
 
   try {
-    initDb();
+    await initDb();
   } catch (err) {
     console.error('Failed to initialize database:', err);
   }
 
   // Seed admin if not exists
-  const seedAdmin = () => {
-    const admin = db.prepare('SELECT * FROM users WHERE username = ?').get('admin');
+  const seedAdmin = async () => {
+    const adminResult = await db.execute({
+      sql: 'SELECT * FROM users WHERE username = ?',
+      args: ['admin']
+    });
+    const admin = adminResult.rows[0];
     if (!admin) {
       const hashedPassword = bcrypt.hashSync('admin123', 10);
-      db.prepare('INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)').run(
-        'admin', hashedPassword, 'admin', 'System Administrator'
-      );
+      await db.execute({
+        sql: 'INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)',
+        args: ['admin', hashedPassword, 'admin', 'System Administrator']
+      });
       console.log('Admin user seeded: admin / admin123');
     }
   };
 
-  const seedRooms = () => {
-    const existingRooms = db.prepare('SELECT number FROM rooms').all() as { number: string }[];
+  const seedRooms = async () => {
+    const existingRoomsResult = await db.execute('SELECT number FROM rooms');
+    const existingRooms = existingRoomsResult.rows as unknown as { number: string }[];
     const existingNumbers = new Set(existingRooms.map(r => r.number));
     
     const categories = [
@@ -49,27 +55,31 @@ async function startServer() {
       { prefix: 'C', type: 'Suite', price: 8500 }
     ];
 
-    const insert = db.prepare('INSERT INTO rooms (number, type, price) VALUES (?, ?, ?)');
-    
-    db.transaction(() => {
-      categories.forEach(cat => {
-        for (let i = 1; i <= 10; i++) {
-          const num = `${cat.prefix}${i.toString().padStart(3, '0')}`;
-          if (!existingNumbers.has(num)) {
-            insert.run(num, cat.type, cat.price);
-          }
+    const statements = [];
+    categories.forEach(cat => {
+      for (let i = 1; i <= 10; i++) {
+        const num = `${cat.prefix}${i.toString().padStart(3, '0')}`;
+        if (!existingNumbers.has(num)) {
+          statements.push({
+            sql: 'INSERT INTO rooms (number, type, price) VALUES (?, ?, ?)',
+            args: [num, cat.type, cat.price]
+          });
         }
-      });
-    })();
+      }
+    });
+    
+    if (statements.length > 0) {
+      await db.batch(statements, 'write');
+    }
   };
 
-  const seedInventory = () => {
+  const seedInventory = async () => {
     console.log('Seeding inventory...');
-    const existingItems = db.prepare('SELECT name FROM inventory_items').all() as { name: string }[];
+    const existingItemsResult = await db.execute('SELECT name FROM inventory_items');
+    const existingItems = existingItemsResult.rows as unknown as { name: string }[];
     const existingNames = new Set(existingItems.map(i => i.name.toLowerCase().trim()));
     console.log(`Found ${existingNames.size} existing items.`);
     
-    const insert = db.prepare('INSERT INTO inventory_items (name, category, stock_quantity, cost_price, selling_price, min_stock_level) VALUES (?, ?, ?, ?, ?, ?)');
     const items = [
       ['Chicken (Whole)', 'food', 50, 650, 1200],
       ['Chicken Breast (kg)', 'food', 30, 700, 1300],
@@ -114,22 +124,28 @@ async function startServer() {
     ];
 
     let insertedCount = 0;
-    db.transaction(() => {
-      items.forEach(item => {
-        const name = (item[0] as string).toLowerCase().trim();
-        if (!existingNames.has(name)) {
-          insert.run(item[0], item[1], item[2], item[3], item[4], 5);
-          insertedCount++;
-        }
-      });
-    })();
+    const statements = [];
+    items.forEach(item => {
+      const name = (item[0] as string).toLowerCase().trim();
+      if (!existingNames.has(name)) {
+        statements.push({
+          sql: 'INSERT INTO inventory_items (name, category, stock_quantity, cost_price, selling_price, min_stock_level) VALUES (?, ?, ?, ?, ?, ?)',
+          args: [item[0], item[1], item[2], item[3], item[4], 5]
+        });
+        insertedCount++;
+      }
+    });
+
+    if (statements.length > 0) {
+      await db.batch(statements, 'write');
+    }
     console.log(`Seeded ${insertedCount} new inventory items.`);
   };
 
   try {
-    seedAdmin();
-    seedRooms();
-    seedInventory();
+    await seedAdmin();
+    await seedRooms();
+    await seedInventory();
   } catch (err) {
     console.error('Failed to seed data:', err);
   }
@@ -158,268 +174,446 @@ async function startServer() {
   };
 
   // --- Auth Routes ---
-  app.post("/api/auth/login", (req, res) => {
+  app.post("/api/auth/login", async (req, res) => {
     const { username, password } = req.body;
     
     if (!username || !password) {
       return res.status(400).json({ message: "Username and password are required" });
     }
 
-    const user: any = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    try {
+      const userResult = await db.execute({
+        sql: 'SELECT * FROM users WHERE username = ?',
+        args: [username]
+      });
+      const user: any = userResult.rows[0];
 
-    if (!user || !bcrypt.compareSync(password, user.password)) {
-      return res.status(401).json({ message: "Invalid credentials" });
+      if (!user || !bcrypt.compareSync(password, user.password)) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+
+      const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET);
+      res.json({ token, user: { id: user.id, username: user.username, role: user.role, name: user.name } });
+    } catch (error) {
+      console.error("Login error:", error);
+      res.status(500).json({ message: "Internal server error" });
     }
-
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET);
-    res.json({ token, user: { id: user.id, username: user.username, role: user.role, name: user.name } });
   });
 
   // --- Rooms API ---
-  app.get("/api/rooms/:id/active-stay", authenticateToken, (req, res) => {
-    const stay = db.prepare("SELECT * FROM stays WHERE room_id = ? AND status = 'active'").get(req.params.id);
-    if (!stay) return res.status(404).json({ message: "No active stay" });
-    res.json({ stay });
+  app.get("/api/rooms/:id/active-stay", authenticateToken, async (req, res) => {
+    try {
+      const stayResult = await db.execute({
+        sql: "SELECT * FROM stays WHERE room_id = ? AND status = 'active'",
+        args: [req.params.id]
+      });
+      const stay = stayResult.rows[0];
+      if (!stay) return res.status(404).json({ message: "No active stay" });
+      res.json({ stay });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/rooms", authenticateToken, (req, res) => {
-    const rooms = db.prepare(`
-      SELECT r.*, s.id as stay_id, g.name as guest_name
-      FROM rooms r
-      LEFT JOIN stays s ON r.id = s.room_id AND s.status = 'active'
-      LEFT JOIN guests g ON s.guest_id = g.id
-    `).all();
-    res.json(rooms);
+  app.get("/api/rooms", authenticateToken, async (req, res) => {
+    try {
+      const roomsResult = await db.execute(`
+        SELECT r.*, s.id as stay_id, g.name as guest_name
+        FROM rooms r
+        LEFT JOIN stays s ON r.id = s.room_id AND s.status = 'active'
+        LEFT JOIN guests g ON s.guest_id = g.id
+      `);
+      res.json(roomsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.post("/api/rooms", authenticateToken, authorize(['admin', 'receptionist']), (req, res) => {
+  app.post("/api/rooms", authenticateToken, authorize(['admin', 'receptionist']), async (req, res) => {
     const { number, type, price } = req.body;
     try {
-      const result = db.prepare('INSERT INTO rooms (number, type, price) VALUES (?, ?, ?)').run(number, type, price);
+      const result = await db.execute({
+        sql: 'INSERT INTO rooms (number, type, price) VALUES (?, ?, ?)',
+        args: [number, type, price]
+      });
       res.json({ id: result.lastInsertRowid });
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
   });
 
-  app.patch("/api/rooms/:id/status", authenticateToken, (req, res) => {
+  app.patch("/api/rooms/:id/status", authenticateToken, async (req, res) => {
     const { status } = req.body;
-    db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run(status, req.params.id);
-    res.json({ success: true });
+    try {
+      await db.execute({
+        sql: 'UPDATE rooms SET status = ? WHERE id = ?',
+        args: [status, req.params.id]
+      });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Guests API ---
-  app.get("/api/guests", authenticateToken, (req, res) => {
-    const guests = db.prepare('SELECT * FROM guests').all();
-    res.json(guests);
+  app.get("/api/guests", authenticateToken, async (req, res) => {
+    try {
+      const guestsResult = await db.execute('SELECT * FROM guests');
+      res.json(guestsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Check-in API ---
-  app.post("/api/check-in", authenticateToken, authorize(['admin', 'receptionist']), (req, res) => {
+  app.post("/api/check-in", authenticateToken, authorize(['admin', 'receptionist']), async (req, res) => {
     const { guestName, phone, idNumber, roomId, checkInDate, expectedCheckOutDate, deposit, paymentMethod } = req.body;
     
-    db.transaction(() => {
-      // Create guest if not exists (simplified for demo)
-      let guest: any = db.prepare('SELECT id FROM guests WHERE id_number = ?').get(idNumber);
-      if (!guest) {
-        const result = db.prepare('INSERT INTO guests (name, phone, id_number) VALUES (?, ?, ?)').run(guestName, phone, idNumber);
-        guest = { id: result.lastInsertRowid };
-      }
+    try {
+      const statements = [];
+      let guestId;
 
-      // Create stay
-      const stayResult = db.prepare('INSERT INTO stays (guest_id, room_id, check_in_date) VALUES (?, ?, ?)').run(guest.id, roomId, checkInDate);
-      const stayId = stayResult.lastInsertRowid;
+      // Check if guest exists
+      const guestResult = await db.execute({
+        sql: 'SELECT id FROM guests WHERE id_number = ?',
+        args: [idNumber]
+      });
       
-      // Update room status
-      db.prepare("UPDATE rooms SET status = 'occupied' WHERE id = ?").run(roomId);
-
-      // Record deposit if any
-      if (deposit && parseFloat(deposit) > 0) {
-        db.prepare('INSERT INTO payments (stay_id, amount, method) VALUES (?, ?, ?)').run(
-          stayId, parseFloat(deposit), paymentMethod || 'Cash'
-        );
+      if (guestResult.rows.length > 0) {
+        guestId = guestResult.rows[0].id;
       }
-    })();
+      
+      const tx = await db.transaction('write');
+      try {
+        if (!guestId) {
+          const insertGuestResult = await tx.execute({
+            sql: 'INSERT INTO guests (name, phone, id_number) VALUES (?, ?, ?)',
+            args: [guestName, phone, idNumber]
+          });
+          guestId = insertGuestResult.lastInsertRowid;
+        }
+        
+        const stayResult = await tx.execute({
+          sql: 'INSERT INTO stays (guest_id, room_id, check_in_date) VALUES (?, ?, ?)',
+          args: [guestId, roomId, checkInDate]
+        });
+        const stayId = stayResult.lastInsertRowid;
 
-    res.json({ success: true });
+        await tx.execute({
+          sql: "UPDATE rooms SET status = 'occupied' WHERE id = ?",
+          args: [roomId]
+        });
+
+        if (deposit && parseFloat(deposit) > 0) {
+          await tx.execute({
+            sql: 'INSERT INTO payments (stay_id, amount, method) VALUES (?, ?, ?)',
+            args: [stayId, parseFloat(deposit), paymentMethod || 'Cash']
+          });
+        }
+        await tx.commit();
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
+
+      res.json({ success: true });
+    } catch (e: any) {
+      console.error("Check-in error:", e);
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- POS API ---
-  app.get("/api/inventory", authenticateToken, (req, res) => {
-    const items = db.prepare('SELECT * FROM inventory_items').all();
-    res.json(items);
+  app.get("/api/inventory", authenticateToken, async (req, res) => {
+    try {
+      const itemsResult = await db.execute('SELECT * FROM inventory_items');
+      res.json(itemsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/inventory/:id/movements", authenticateToken, (req, res) => {
-    const movements = db.prepare(`
-      SELECT * FROM stock_movements 
-      WHERE inventory_item_id = ? 
-      ORDER BY created_at DESC
-    `).all(req.params.id);
-    res.json(movements);
-  });
-
-  app.post("/api/inventory", authenticateToken, authorize(['admin']), (req, res) => {
-    const { name, category, cost_price, selling_price, stock_quantity, min_stock_level } = req.body;
-    const result = db.prepare('INSERT INTO inventory_items (name, category, cost_price, selling_price, stock_quantity, min_stock_level) VALUES (?, ?, ?, ?, ?, ?)').run(
-      name, category, cost_price, selling_price, stock_quantity, min_stock_level
-    );
-    res.json({ id: result.lastInsertRowid });
-  });
-
-  app.patch("/api/inventory/:id", authenticateToken, authorize(['admin']), (req, res) => {
-    const { name, category, cost_price, selling_price, stock_quantity, min_stock_level } = req.body;
-    db.prepare(`
-      UPDATE inventory_items 
-      SET name = ?, category = ?, cost_price = ?, selling_price = ?, stock_quantity = ?, min_stock_level = ? 
-      WHERE id = ?
-    `).run(name, category, cost_price, selling_price, stock_quantity, min_stock_level, req.params.id);
-    res.json({ success: true });
-  });
-
-  app.post("/api/orders", authenticateToken, authorize(['admin', 'waiter']), (req, res) => {
-    const { stayId, items, paymentStatus, fulfillmentStatus, paymentMethod } = req.body; // items: [{id, quantity, price}]
-    
-    db.transaction(() => {
-      let total = 0;
-      items.forEach((item: any) => total += item.price * item.quantity);
-
-      const orderResult = db.prepare('INSERT INTO orders (stay_id, user_id, total_amount, payment_status, fulfillment_status) VALUES (?, ?, ?, ?, ?)').run(
-        stayId || null, (req as any).user.id, total, paymentStatus, fulfillmentStatus || 'pending'
-      );
-      const orderId = orderResult.lastInsertRowid;
-
-      items.forEach((item: any) => {
-        db.prepare('INSERT INTO order_items (order_id, inventory_item_id, quantity, unit_price) VALUES (?, ?, ?, ?)').run(
-          orderId, item.id, item.quantity, item.price
-        );
-        // Reduce inventory
-        db.prepare('UPDATE inventory_items SET stock_quantity = stock_quantity - ? WHERE id = ?').run(item.quantity, item.id);
-        // Record movement
-        db.prepare("INSERT INTO stock_movements (inventory_item_id, type, quantity, reason) VALUES (?, 'out', ?, ?)").run(
-          item.id, item.quantity, `Order #${orderId}`
-        );
+  app.get("/api/inventory/:id/movements", authenticateToken, async (req, res) => {
+    try {
+      const movementsResult = await db.execute({
+        sql: `
+          SELECT * FROM stock_movements 
+          WHERE inventory_item_id = ? 
+          ORDER BY created_at DESC
+        `,
+        args: [req.params.id]
       });
+      res.json(movementsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
 
-      // If paid immediately, record in payments
-      if (paymentStatus === 'paid') {
-        db.prepare('INSERT INTO payments (order_id, amount, method) VALUES (?, ?, ?)').run(
-          orderId, total, paymentMethod || 'Cash'
-        );
+  app.post("/api/inventory", authenticateToken, authorize(['admin']), async (req, res) => {
+    const { name, category, cost_price, selling_price, stock_quantity, min_stock_level } = req.body;
+    try {
+      const result = await db.execute({
+        sql: 'INSERT INTO inventory_items (name, category, cost_price, selling_price, stock_quantity, min_stock_level) VALUES (?, ?, ?, ?, ?, ?)',
+        args: [name, category, cost_price, selling_price, stock_quantity, min_stock_level]
+      });
+      res.json({ id: result.lastInsertRowid });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.patch("/api/inventory/:id", authenticateToken, authorize(['admin']), async (req, res) => {
+    const { name, category, cost_price, selling_price, stock_quantity, min_stock_level } = req.body;
+    try {
+      await db.execute({
+        sql: `
+          UPDATE inventory_items 
+          SET name = ?, category = ?, cost_price = ?, selling_price = ?, stock_quantity = ?, min_stock_level = ? 
+          WHERE id = ?
+        `,
+        args: [name, category, cost_price, selling_price, stock_quantity, min_stock_level, req.params.id]
+      });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.post("/api/orders", authenticateToken, authorize(['admin', 'waiter']), async (req, res) => {
+    const { stayId, items, paymentStatus, fulfillmentStatus, paymentMethod } = req.body;
+    
+    try {
+      const tx = await db.transaction('write');
+      try {
+        let total = 0;
+        items.forEach((item: any) => total += item.price * item.quantity);
+
+        const orderResult = await tx.execute({
+          sql: 'INSERT INTO orders (stay_id, user_id, total_amount, payment_status, fulfillment_status) VALUES (?, ?, ?, ?, ?)',
+          args: [stayId || null, (req as any).user.id, total, paymentStatus, fulfillmentStatus || 'pending']
+        });
+        const orderId = orderResult.lastInsertRowid;
+
+        for (const item of items) {
+          await tx.execute({
+            sql: 'INSERT INTO order_items (order_id, inventory_item_id, quantity, unit_price) VALUES (?, ?, ?, ?)',
+            args: [orderId, item.id, item.quantity, item.price]
+          });
+          await tx.execute({
+            sql: 'UPDATE inventory_items SET stock_quantity = stock_quantity - ? WHERE id = ?',
+            args: [item.quantity, item.id]
+          });
+          await tx.execute({
+            sql: "INSERT INTO stock_movements (inventory_item_id, type, quantity, reason) VALUES (?, 'out', ?, ?)",
+            args: [item.id, item.quantity, `Order #${orderId}`]
+          });
+        }
+
+        if (paymentStatus === 'paid') {
+          await tx.execute({
+            sql: 'INSERT INTO payments (order_id, amount, method) VALUES (?, ?, ?)',
+            args: [orderId, total, paymentMethod || 'Cash']
+          });
+        }
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
       }
-    })();
-
-    res.json({ success: true });
+    } catch (e: any) {
+      console.error("Order error:", e);
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Billing API ---
-  app.get("/api/stays/:id/bill", authenticateToken, (req, res) => {
-    const stay: any = db.prepare(`
-      SELECT s.*, r.number as room_number, r.price as room_price, g.name as guest_name
-      FROM stays s
-      JOIN rooms r ON s.room_id = r.id
-      JOIN guests g ON s.guest_id = g.id
-      WHERE s.id = ?
-    `).get(req.params.id);
+  app.get("/api/stays/:id/bill", authenticateToken, async (req, res) => {
+    try {
+      const stayResult = await db.execute({
+        sql: `
+          SELECT s.*, r.number as room_number, r.price as room_price, g.name as guest_name
+          FROM stays s
+          JOIN rooms r ON s.room_id = r.id
+          JOIN guests g ON s.guest_id = g.id
+          WHERE s.id = ?
+        `,
+        args: [req.params.id]
+      });
+      const stay = stayResult.rows[0];
 
-    if (!stay) return res.status(404).json({ message: "Stay not found" });
+      if (!stay) return res.status(404).json({ message: "Stay not found" });
 
-    const orders = db.prepare(`
-      SELECT o.*, GROUP_CONCAT(ii.name || ' (x' || oi.quantity || ')') as items_summary
-      FROM orders o
-      JOIN order_items oi ON o.id = oi.order_id
-      JOIN inventory_items ii ON oi.inventory_item_id = ii.id
-      WHERE o.stay_id = ?
-      GROUP BY o.id
-    `).all(req.params.id);
+      const ordersResult = await db.execute({
+        sql: `
+          SELECT o.*, GROUP_CONCAT(ii.name || ' (x' || oi.quantity || ')') as items_summary
+          FROM orders o
+          JOIN order_items oi ON o.id = oi.order_id
+          JOIN inventory_items ii ON oi.inventory_item_id = ii.id
+          WHERE o.stay_id = ?
+          GROUP BY o.id
+        `,
+        args: [req.params.id]
+      });
 
-    res.json({ stay, orders });
+      res.json({ stay, orders: ordersResult.rows });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Checkout API ---
-  app.post("/api/stays/:id/check-out", authenticateToken, authorize(['admin', 'receptionist']), (req, res) => {
+  app.post("/api/stays/:id/check-out", authenticateToken, authorize(['admin', 'receptionist']), async (req, res) => {
     const { totalRoomCharges, paymentMethod } = req.body;
     
-    db.transaction(() => {
-      const stay: any = db.prepare('SELECT room_id FROM stays WHERE id = ?').get(req.params.id);
-      
-      // Update stay
-      db.prepare("UPDATE stays SET status = 'completed', total_room_charges = ?, check_out_date = CURRENT_TIMESTAMP WHERE id = ?").run(
-        totalRoomCharges, req.params.id
-      );
-      
-      // Update room status
-      db.prepare("UPDATE rooms SET status = 'available' WHERE id = ?").run(stay.room_id);
+    try {
+      const tx = await db.transaction('write');
+      try {
+        const stayResult = await tx.execute({
+          sql: 'SELECT room_id FROM stays WHERE id = ?',
+          args: [req.params.id]
+        });
+        const stay: any = stayResult.rows[0];
+        
+        await tx.execute({
+          sql: "UPDATE stays SET status = 'completed', total_room_charges = ?, check_out_date = CURRENT_TIMESTAMP WHERE id = ?",
+          args: [totalRoomCharges, req.params.id]
+        });
+        
+        await tx.execute({
+          sql: "UPDATE rooms SET status = 'available' WHERE id = ?",
+          args: [stay.room_id]
+        });
 
-      // Record payment
-      db.prepare('INSERT INTO payments (stay_id, amount, method) VALUES (?, ?, ?)').run(
-        req.params.id, totalRoomCharges, paymentMethod
-      );
-    })();
-
-    res.json({ success: true });
+        await tx.execute({
+          sql: 'INSERT INTO payments (stay_id, amount, method) VALUES (?, ?, ?)',
+          args: [req.params.id, totalRoomCharges, paymentMethod]
+        });
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Reservations API ---
-  app.get("/api/reservations", authenticateToken, (req, res) => {
-    const reservations = db.prepare(`
-      SELECT res.*, g.name as guest_name, r.number as room_number
-      FROM reservations res
-      JOIN guests g ON res.guest_id = g.id
-      JOIN rooms r ON res.room_id = r.id
-      ORDER BY res.check_in_date DESC
-    `).all();
-    res.json(reservations);
+  app.get("/api/reservations", authenticateToken, async (req, res) => {
+    try {
+      const reservationsResult = await db.execute(`
+        SELECT res.*, g.name as guest_name, r.number as room_number
+        FROM reservations res
+        JOIN guests g ON res.guest_id = g.id
+        JOIN rooms r ON res.room_id = r.id
+        ORDER BY res.check_in_date DESC
+      `);
+      res.json(reservationsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.post("/api/reservations", authenticateToken, authorize(['admin', 'receptionist']), (req, res) => {
+  app.post("/api/reservations", authenticateToken, authorize(['admin', 'receptionist']), async (req, res) => {
     const { guestName, phone, idNumber, roomId, checkInDate, checkOutDate, deposit } = req.body;
     
-    db.transaction(() => {
-      let guest: any = db.prepare('SELECT id FROM guests WHERE id_number = ?').get(idNumber);
-      if (!guest) {
-        const result = db.prepare('INSERT INTO guests (name, phone, id_number) VALUES (?, ?, ?)').run(guestName, phone, idNumber);
-        guest = { id: result.lastInsertRowid };
+    try {
+      const tx = await db.transaction('write');
+      try {
+        let guestId;
+        const guestResult = await tx.execute({
+          sql: 'SELECT id FROM guests WHERE id_number = ?',
+          args: [idNumber]
+        });
+        
+        if (guestResult.rows.length > 0) {
+          guestId = guestResult.rows[0].id;
+        } else {
+          const insertGuestResult = await tx.execute({
+            sql: 'INSERT INTO guests (name, phone, id_number) VALUES (?, ?, ?)',
+            args: [guestName, phone, idNumber]
+          });
+          guestId = insertGuestResult.lastInsertRowid;
+        }
+
+        await tx.execute({
+          sql: 'INSERT INTO reservations (guest_id, room_id, check_in_date, check_out_date, deposit) VALUES (?, ?, ?, ?, ?)',
+          args: [guestId, roomId, checkInDate, checkOutDate, deposit || 0]
+        });
+        
+        await tx.execute({
+          sql: "UPDATE rooms SET status = 'reserved' WHERE id = ?",
+          args: [roomId]
+        });
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
       }
-
-      db.prepare('INSERT INTO reservations (guest_id, room_id, check_in_date, check_out_date, deposit) VALUES (?, ?, ?, ?, ?)').run(
-        guest.id, roomId, checkInDate, checkOutDate, deposit || 0
-      );
-      
-      db.prepare("UPDATE rooms SET status = 'reserved' WHERE id = ?").run(roomId);
-    })();
-
-    res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.patch("/api/reservations/:id/status", authenticateToken, authorize(['admin', 'receptionist']), (req, res) => {
+  app.patch("/api/reservations/:id/status", authenticateToken, authorize(['admin', 'receptionist']), async (req, res) => {
     const { status } = req.body;
-    db.transaction(() => {
-      const reservation: any = db.prepare('SELECT room_id FROM reservations WHERE id = ?').get(req.params.id);
-      db.prepare('UPDATE reservations SET status = ? WHERE id = ?').run(status, req.params.id);
-      
-      if (status === 'cancelled' || status === 'completed') {
-        db.prepare("UPDATE rooms SET status = 'available' WHERE id = ?").run(reservation.room_id);
-      } else if (status === 'confirmed') {
-        db.prepare("UPDATE rooms SET status = 'reserved' WHERE id = ?").run(reservation.room_id);
+    try {
+      const tx = await db.transaction('write');
+      try {
+        const reservationResult = await tx.execute({
+          sql: 'SELECT room_id FROM reservations WHERE id = ?',
+          args: [req.params.id]
+        });
+        const reservation: any = reservationResult.rows[0];
+
+        await tx.execute({
+          sql: 'UPDATE reservations SET status = ? WHERE id = ?',
+          args: [status, req.params.id]
+        });
+        
+        if (status === 'cancelled' || status === 'completed') {
+          await tx.execute({
+            sql: "UPDATE rooms SET status = 'available' WHERE id = ?",
+            args: [reservation.room_id]
+          });
+        } else if (status === 'confirmed') {
+          await tx.execute({
+            sql: "UPDATE rooms SET status = 'reserved' WHERE id = ?",
+            args: [reservation.room_id]
+          });
+        }
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
       }
-    })();
-    res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Users API (Settings) ---
-  app.get("/api/users", authenticateToken, authorize(['admin']), (req, res) => {
-    const users = db.prepare('SELECT id, username, role, name FROM users').all();
-    res.json(users);
+  app.get("/api/users", authenticateToken, authorize(['admin']), async (req, res) => {
+    try {
+      const usersResult = await db.execute('SELECT id, username, role, name FROM users');
+      res.json(usersResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.post("/api/users", authenticateToken, authorize(['admin']), (req, res) => {
+  app.post("/api/users", authenticateToken, authorize(['admin']), async (req, res) => {
     const { username, password, role, name } = req.body;
     const hashedPassword = bcrypt.hashSync(password, 10);
     try {
-      const result = db.prepare('INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)').run(
-        username, hashedPassword, role, name
-      );
+      const result = await db.execute({
+        sql: 'INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)',
+        args: [username, hashedPassword, role, name]
+      });
       res.json({ id: result.lastInsertRowid });
     } catch (e: any) {
       res.status(400).json({ message: "Username already exists" });
@@ -427,324 +621,473 @@ async function startServer() {
   });
 
   // --- Reports API Extensions ---
-  app.get("/api/reports/inventory", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const inventory = db.prepare(`
-      SELECT name, stock_quantity, min_stock_level, category
-      FROM inventory_items
-    `).all();
-    res.json(inventory);
+  app.get("/api/reports/inventory", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const inventoryResult = await db.execute(`
+        SELECT name, stock_quantity, min_stock_level, category
+        FROM inventory_items
+      `);
+      res.json(inventoryResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/reports/rooms", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const data = db.prepare(`
-      SELECT type, COUNT(*) as count, SUM(CASE WHEN status = 'occupied' THEN 1 ELSE 0 END) as occupied_count
-      FROM rooms
-      GROUP BY type
-    `).all();
-    res.json(data);
+  app.get("/api/reports/rooms", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const dataResult = await db.execute(`
+        SELECT type, COUNT(*) as count, SUM(CASE WHEN status = 'occupied' THEN 1 ELSE 0 END) as occupied_count
+        FROM rooms
+        GROUP BY type
+      `);
+      res.json(dataResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/reports/sales", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const sales = db.prepare(`
-      SELECT date(created_at) as date, SUM(total_amount) as total
-      FROM orders
-      GROUP BY date(created_at)
-      ORDER BY date DESC
-      LIMIT 30
-    `).all();
-    res.json(sales);
+  app.get("/api/reports/sales", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const salesResult = await db.execute(`
+        SELECT date(created_at) as date, SUM(total_amount) as total
+        FROM orders
+        GROUP BY date(created_at)
+        ORDER BY date DESC
+        LIMIT 30
+      `);
+      res.json(salesResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/reports/revenue-breakdown", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.get("/api/reports/revenue-breakdown", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const date = req.query.date || 'today';
     const dateCondition = date === 'today' ? "date(created_at) = date('now')" : "date(created_at) = ?";
     const params = date === 'today' ? [] : [date];
 
-    const restaurant = db.prepare(`
-      SELECT SUM(oi.quantity * oi.unit_price) as total
-      FROM orders o
-      JOIN order_items oi ON o.id = oi.order_id
-      JOIN inventory_items ii ON oi.inventory_item_id = ii.id
-      WHERE ${dateCondition} AND ii.category = 'food'
-    `).get(...params) as { total: number };
+    try {
+      const restaurantResult = await db.execute({
+        sql: `
+          SELECT SUM(oi.quantity * oi.unit_price) as total
+          FROM orders o
+          JOIN order_items oi ON o.id = oi.order_id
+          JOIN inventory_items ii ON oi.inventory_item_id = ii.id
+          WHERE ${dateCondition} AND ii.category = 'food'
+        `,
+        args: params as any[]
+      });
+      const restaurant = restaurantResult.rows[0] as unknown as { total: number };
 
-    const bar = db.prepare(`
-      SELECT SUM(oi.quantity * oi.unit_price) as total
-      FROM orders o
-      JOIN order_items oi ON o.id = oi.order_id
-      JOIN inventory_items ii ON oi.inventory_item_id = ii.id
-      WHERE ${dateCondition} AND ii.category = 'drink'
-    `).get(...params) as { total: number };
+      const barResult = await db.execute({
+        sql: `
+          SELECT SUM(oi.quantity * oi.unit_price) as total
+          FROM orders o
+          JOIN order_items oi ON o.id = oi.order_id
+          JOIN inventory_items ii ON oi.inventory_item_id = ii.id
+          WHERE ${dateCondition} AND ii.category = 'drink'
+        `,
+        args: params as any[]
+      });
+      const bar = barResult.rows[0] as unknown as { total: number };
 
-    const rooms = db.prepare(`
-      SELECT SUM(amount) as total
-      FROM payments
-      WHERE ${dateCondition} AND stay_id IS NOT NULL AND order_id IS NULL
-    `).get(...params) as { total: number };
+      const roomsResult = await db.execute({
+        sql: `
+          SELECT SUM(amount) as total
+          FROM payments
+          WHERE ${dateCondition} AND stay_id IS NOT NULL AND order_id IS NULL
+        `,
+        args: params as any[]
+      });
+      const rooms = roomsResult.rows[0] as unknown as { total: number };
 
-    res.json({
-      restaurant: restaurant.total || 0,
-      bar: bar.total || 0,
-      rooms: rooms.total || 0
-    });
+      res.json({
+        restaurant: restaurant?.total || 0,
+        bar: bar?.total || 0,
+        rooms: rooms?.total || 0
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/reports/detailed-sales", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const sales = db.prepare(`
-      SELECT 
-        ii.name,
-        ii.category,
-        SUM(oi.quantity) as total_quantity,
-        SUM(oi.quantity * oi.unit_price) as total_sales,
-        SUM(oi.quantity * (oi.unit_price - ii.cost_price)) as total_profit
-      FROM order_items oi
-      JOIN inventory_items ii ON oi.inventory_item_id = ii.id
-      JOIN orders o ON oi.order_id = o.id
-      GROUP BY ii.id
-      ORDER BY total_sales DESC
-    `).all();
-    res.json(sales);
+  app.get("/api/reports/detailed-sales", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const salesResult = await db.execute(`
+        SELECT 
+          ii.name,
+          ii.category,
+          SUM(oi.quantity) as total_quantity,
+          SUM(oi.quantity * oi.unit_price) as total_sales,
+          SUM(oi.quantity * (oi.unit_price - ii.cost_price)) as total_profit
+        FROM order_items oi
+        JOIN inventory_items ii ON oi.inventory_item_id = ii.id
+        JOIN orders o ON oi.order_id = o.id
+        GROUP BY ii.id
+        ORDER BY total_sales DESC
+      `);
+      res.json(salesResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/orders", authenticateToken, (req, res) => {
-    const orders = db.prepare(`
-      SELECT o.*, u.name as waiter_name, r.number as room_number, g.name as guest_name,
-             GROUP_CONCAT(ii.name || ' (x' || oi.quantity || ')') as items_summary
-      FROM orders o
-      JOIN users u ON o.user_id = u.id
-      LEFT JOIN stays s ON o.stay_id = s.id
-      LEFT JOIN rooms r ON s.room_id = r.id
-      LEFT JOIN guests g ON s.guest_id = g.id
-      JOIN order_items oi ON o.id = oi.order_id
-      JOIN inventory_items ii ON oi.inventory_item_id = ii.id
-      GROUP BY o.id
-      ORDER BY o.created_at DESC
-    `).all();
-    res.json(orders);
+  app.get("/api/orders", authenticateToken, async (req, res) => {
+    try {
+      const ordersResult = await db.execute(`
+        SELECT o.*, u.name as waiter_name, r.number as room_number, g.name as guest_name,
+               GROUP_CONCAT(ii.name || ' (x' || oi.quantity || ')') as items_summary
+        FROM orders o
+        JOIN users u ON o.user_id = u.id
+        LEFT JOIN stays s ON o.stay_id = s.id
+        LEFT JOIN rooms r ON s.room_id = r.id
+        LEFT JOIN guests g ON s.guest_id = g.id
+        JOIN order_items oi ON o.id = oi.order_id
+        JOIN inventory_items ii ON oi.inventory_item_id = ii.id
+        GROUP BY o.id
+        ORDER BY o.created_at DESC
+      `);
+      res.json(ordersResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Kitchen Inventory API ---
-  app.get("/api/kitchen/inventory", authenticateToken, (req, res) => {
-    const items = db.prepare('SELECT * FROM kitchen_inventory').all();
-    res.json(items);
+  app.get("/api/kitchen/inventory", authenticateToken, async (req, res) => {
+    try {
+      const itemsResult = await db.execute('SELECT * FROM kitchen_inventory');
+      res.json(itemsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.post("/api/kitchen/inventory", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.post("/api/kitchen/inventory", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const { name, unit, min_stock_level, initialStock } = req.body;
     try {
-      db.transaction(() => {
-        const result = db.prepare('INSERT INTO kitchen_inventory (name, unit, current_stock, min_stock_level) VALUES (?, ?, ?, ?)').run(
-          name, unit, initialStock || 0, min_stock_level || 5
-        );
+      const tx = await db.transaction('write');
+      try {
+        const result = await tx.execute({
+          sql: 'INSERT INTO kitchen_inventory (name, unit, current_stock, min_stock_level) VALUES (?, ?, ?, ?)',
+          args: [name, unit, initialStock || 0, min_stock_level || 5]
+        });
         if (initialStock > 0) {
-          db.prepare('INSERT INTO kitchen_movements (item_id, type, quantity, staff_id, reason) VALUES (?, ?, ?, ?, ?)').run(
-            result.lastInsertRowid, 'in', initialStock, (req as any).user.id, 'Initial Stock'
-          );
+          await tx.execute({
+            sql: 'INSERT INTO kitchen_movements (item_id, type, quantity, staff_id, reason) VALUES (?, ?, ?, ?, ?)',
+            args: [result.lastInsertRowid, 'in', initialStock, (req as any).user.id, 'Initial Stock']
+          });
         }
+        await tx.commit();
         res.json({ id: result.lastInsertRowid });
-      })();
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
   });
 
-  app.post("/api/kitchen/movements", authenticateToken, (req, res) => {
+  app.post("/api/kitchen/movements", authenticateToken, async (req, res) => {
     const { itemId, type, quantity, reason } = req.body;
     const staffId = (req as any).user.id;
 
-    db.transaction(() => {
-      db.prepare('INSERT INTO kitchen_movements (item_id, type, quantity, staff_id, reason) VALUES (?, ?, ?, ?, ?)').run(
-        itemId, type, quantity, staffId, reason
-      );
-      
-      const adjustment = type === 'in' ? quantity : -quantity;
-      db.prepare('UPDATE kitchen_inventory SET current_stock = current_stock + ? WHERE id = ?').run(adjustment, itemId);
-    })();
-
-    res.json({ success: true });
+    try {
+      const tx = await db.transaction('write');
+      try {
+        await tx.execute({
+          sql: 'INSERT INTO kitchen_movements (item_id, type, quantity, staff_id, reason) VALUES (?, ?, ?, ?, ?)',
+          args: [itemId, type, quantity, staffId, reason]
+        });
+        
+        const adjustment = type === 'in' ? quantity : -quantity;
+        await tx.execute({
+          sql: 'UPDATE kitchen_inventory SET current_stock = current_stock + ? WHERE id = ?',
+          args: [adjustment, itemId]
+        });
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/kitchen/movements", authenticateToken, (req, res) => {
-    const movements = db.prepare(`
-      SELECT km.*, ki.name as item_name, u.name as staff_name
-      FROM kitchen_movements km
-      JOIN kitchen_inventory ki ON km.item_id = ki.id
-      JOIN users u ON km.staff_id = u.id
-      ORDER BY km.created_at DESC
-    `).all();
-    res.json(movements);
+  app.get("/api/kitchen/movements", authenticateToken, async (req, res) => {
+    try {
+      const movementsResult = await db.execute(`
+        SELECT km.*, ki.name as item_name, u.name as staff_name
+        FROM kitchen_movements km
+        JOIN kitchen_inventory ki ON km.item_id = ki.id
+        JOIN users u ON km.staff_id = u.id
+        ORDER BY km.created_at DESC
+      `);
+      res.json(movementsResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.patch("/api/orders/:id/status", authenticateToken, (req, res) => {
+  app.patch("/api/orders/:id/status", authenticateToken, async (req, res) => {
     const { paymentStatus, fulfillmentStatus, paymentMethod } = req.body;
     
-    db.transaction(() => {
-      if (paymentStatus) {
-        db.prepare('UPDATE orders SET payment_status = ? WHERE id = ?').run(paymentStatus, req.params.id);
-        
-        // If paid, record in payments table
-        if (paymentStatus === 'paid') {
-          const order: any = db.prepare('SELECT total_amount FROM orders WHERE id = ?').get(req.params.id);
-          db.prepare('INSERT INTO payments (order_id, amount, method) VALUES (?, ?, ?)').run(
-            req.params.id, order.total_amount, paymentMethod || 'Cash'
-          );
+    try {
+      const tx = await db.transaction('write');
+      try {
+        if (paymentStatus) {
+          await tx.execute({
+            sql: 'UPDATE orders SET payment_status = ? WHERE id = ?',
+            args: [paymentStatus, req.params.id]
+          });
+          
+          if (paymentStatus === 'paid') {
+            const orderResult = await tx.execute({
+              sql: 'SELECT total_amount FROM orders WHERE id = ?',
+              args: [req.params.id]
+            });
+            const order: any = orderResult.rows[0];
+            await tx.execute({
+              sql: 'INSERT INTO payments (order_id, amount, method) VALUES (?, ?, ?)',
+              args: [req.params.id, order.total_amount, paymentMethod || 'Cash']
+            });
+          }
         }
+        if (fulfillmentStatus) {
+          await tx.execute({
+            sql: 'UPDATE orders SET fulfillment_status = ? WHERE id = ?',
+            args: [fulfillmentStatus, req.params.id]
+          });
+        }
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
       }
-      if (fulfillmentStatus) {
-        db.prepare('UPDATE orders SET fulfillment_status = ? WHERE id = ?').run(fulfillmentStatus, req.params.id);
-      }
-    })();
-    
-    res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Finances API ---
-  app.get("/api/finances/summary", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.get("/api/finances/summary", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     
-    // Balances from payments
-    const payments = db.prepare('SELECT method, SUM(amount) as total FROM payments GROUP BY method').all() as any[];
-    const expenses = db.prepare('SELECT method, SUM(amount) as total FROM expenses GROUP BY method').all() as any[];
-    
-    const balances = { cash: 0, mpesa: 0, card: 0 };
-    payments.forEach(p => {
-      const method = p.method.toLowerCase();
-      if (method.includes('cash')) balances.cash += p.total;
-      else if (method.includes('mpesa')) balances.mpesa += p.total;
-      else balances.card += p.total;
-    });
-    expenses.forEach(e => {
-      const method = e.method.toLowerCase();
-      if (method.includes('cash')) balances.cash -= e.total;
-      else if (method.includes('mpesa')) balances.mpesa -= e.total;
-      else balances.card -= e.total;
-    });
+    try {
+      const paymentsResult = await db.execute('SELECT method, SUM(amount) as total FROM payments GROUP BY method');
+      const expensesResult = await db.execute('SELECT method, SUM(amount) as total FROM expenses GROUP BY method');
+      
+      const balances = { cash: 0, mpesa: 0, card: 0 };
+      paymentsResult.rows.forEach((p: any) => {
+        const method = p.method.toLowerCase();
+        if (method.includes('cash')) balances.cash += p.total;
+        else if (method.includes('mpesa')) balances.mpesa += p.total;
+        else balances.card += p.total;
+      });
+      expensesResult.rows.forEach((e: any) => {
+        const method = e.method.toLowerCase();
+        if (method.includes('cash')) balances.cash -= e.total;
+        else if (method.includes('mpesa')) balances.mpesa -= e.total;
+        else balances.card -= e.total;
+      });
 
-    const ordersSummary = db.prepare(`
-      SELECT payment_status, SUM(total_amount) as total, COUNT(*) as count
-      FROM orders 
-      WHERE date(created_at) = date(?)
-      GROUP BY payment_status
-    `).all(today);
+      const ordersSummaryResult = await db.execute({
+        sql: `
+          SELECT payment_status, SUM(total_amount) as total, COUNT(*) as count
+          FROM orders 
+          WHERE date(created_at) = date(?)
+          GROUP BY payment_status
+        `,
+        args: [today]
+      });
 
-    const todaySales = db.prepare('SELECT SUM(amount) as total FROM payments WHERE date(created_at) = date(?)').get(today) as any;
-    const todayExpenses = db.prepare('SELECT SUM(amount) as total FROM expenses WHERE date(created_at) = date(?)').get(today) as any;
+      const todaySalesResult = await db.execute({
+        sql: 'SELECT SUM(amount) as total FROM payments WHERE date(created_at) = date(?)',
+        args: [today]
+      });
+      const todaySales = todaySalesResult.rows[0] as any;
 
-    const roomsSummary = db.prepare(`
-      SELECT status, SUM(total_room_charges) as total 
-      FROM stays 
-      GROUP BY status
-    `).all();
+      const todayExpensesResult = await db.execute({
+        sql: 'SELECT SUM(amount) as total FROM expenses WHERE date(created_at) = date(?)',
+        args: [today]
+      });
+      const todayExpenses = todayExpensesResult.rows[0] as any;
 
-    const totalExpenses = db.prepare('SELECT SUM(amount) as total FROM expenses').get() as any;
+      const roomsSummaryResult = await db.execute(`
+        SELECT status, SUM(total_room_charges) as total 
+        FROM stays 
+        GROUP BY status
+      `);
 
-    res.json({
-      balances,
-      orders: ordersSummary,
-      todaySales: todaySales?.total || 0,
-      todayExpenses: todayExpenses?.total || 0,
-      rooms: roomsSummary,
-      totalExpenses: totalExpenses.total || 0
-    });
+      const totalExpensesResult = await db.execute('SELECT SUM(amount) as total FROM expenses');
+      const totalExpenses = totalExpensesResult.rows[0] as any;
+
+      res.json({
+        balances,
+        orders: ordersSummaryResult.rows,
+        todaySales: todaySales?.total || 0,
+        todayExpenses: todayExpenses?.total || 0,
+        rooms: roomsSummaryResult.rows,
+        totalExpenses: totalExpenses?.total || 0
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/finances/expenses", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const expenses = db.prepare(`
-      SELECT e.*, u.name as recorded_by_name 
-      FROM expenses e 
-      JOIN users u ON e.recorded_by = u.id 
-      ORDER BY e.created_at DESC
-    `).all();
-    res.json(expenses);
+  app.get("/api/finances/expenses", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const expensesResult = await db.execute(`
+        SELECT e.*, u.name as recorded_by_name 
+        FROM expenses e 
+        JOIN users u ON e.recorded_by = u.id 
+        ORDER BY e.created_at DESC
+      `);
+      res.json(expensesResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.get("/api/finances/income", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const income = db.prepare(`
-      SELECT p.*, 
-             g.name as guest_name, 
-             r.number as room_number,
-             o.id as order_id_ref
-      FROM payments p
-      LEFT JOIN stays s ON p.stay_id = s.id
-      LEFT JOIN guests g ON s.guest_id = g.id
-      LEFT JOIN rooms r ON s.room_id = r.id
-      LEFT JOIN orders o ON p.order_id = o.id
-      ORDER BY p.created_at DESC
-    `).all();
-    res.json(income);
+  app.get("/api/finances/income", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const incomeResult = await db.execute(`
+        SELECT p.*, 
+               g.name as guest_name, 
+               r.number as room_number,
+               o.id as order_id_ref
+        FROM payments p
+        LEFT JOIN stays s ON p.stay_id = s.id
+        LEFT JOIN guests g ON s.guest_id = g.id
+        LEFT JOIN rooms r ON s.room_id = r.id
+        LEFT JOIN orders o ON p.order_id = o.id
+        ORDER BY p.created_at DESC
+      `);
+      res.json(incomeResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.post("/api/finances/expenses", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.post("/api/finances/expenses", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const { amount, category, description, method } = req.body;
     const userId = (req as any).user.id;
-    const result = db.prepare('INSERT INTO expenses (amount, category, description, method, recorded_by) VALUES (?, ?, ?, ?, ?)').run(
-      amount, category, description, method, userId
-    );
-    res.json({ id: result.lastInsertRowid });
+    try {
+      const result = await db.execute({
+        sql: 'INSERT INTO expenses (amount, category, description, method, recorded_by) VALUES (?, ?, ?, ?, ?)',
+        args: [amount, category, description, method, userId]
+      });
+      res.json({ id: result.lastInsertRowid });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Staff Management API ---
-  app.get("/api/staff", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const staff = db.prepare("SELECT id, username, role, name, salary, allowances, deductions, status FROM users WHERE status = 'active'").all() as any[];
-    
-    // Enrich with pay items
-    const enrichedStaff = staff.map(s => {
-      const items = db.prepare(`
-        SELECT upi.*, pit.name, pit.type 
-        FROM user_pay_items upi
-        JOIN pay_item_types pit ON upi.item_id = pit.id
-        WHERE upi.user_id = ?
-      `).all(s.id);
-      return { ...s, payItems: items };
-    });
-    
-    res.json(enrichedStaff);
-  });
-
-  app.get("/api/staff/pay-item-types", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const types = db.prepare('SELECT * FROM pay_item_types').all();
-    res.json(types);
-  });
-
-  app.post("/api/staff/pay-item-types", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const { name, type } = req.body;
-    const result = db.prepare('INSERT INTO pay_item_types (name, type) VALUES (?, ?)').run(name, type);
-    res.json({ id: result.lastInsertRowid });
-  });
-
-  app.delete("/api/staff/pay-item-types/:id", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.get("/api/staff", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     try {
-      db.transaction(() => {
+      const staffResult = await db.execute("SELECT id, username, role, name, salary, allowances, deductions, status FROM users WHERE status = 'active'");
+      const staff = staffResult.rows as any[];
+      
+      // Enrich with pay items
+      const enrichedStaff = [];
+      for (const s of staff) {
+        const itemsResult = await db.execute({
+          sql: `
+            SELECT upi.*, pit.name, pit.type 
+            FROM user_pay_items upi
+            JOIN pay_item_types pit ON upi.item_id = pit.id
+            WHERE upi.user_id = ?
+          `,
+          args: [s.id]
+        });
+        enrichedStaff.push({ ...s, payItems: itemsResult.rows });
+      }
+      
+      res.json(enrichedStaff);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.get("/api/staff/pay-item-types", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const typesResult = await db.execute('SELECT * FROM pay_item_types');
+      res.json(typesResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.post("/api/staff/pay-item-types", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    const { name, type } = req.body;
+    try {
+      const result = await db.execute({
+        sql: 'INSERT INTO pay_item_types (name, type) VALUES (?, ?)',
+        args: [name, type]
+      });
+      res.json({ id: result.lastInsertRowid });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.delete("/api/staff/pay-item-types/:id", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const tx = await db.transaction('write');
+      try {
         // Delete associations first
-        db.prepare('DELETE FROM user_pay_items WHERE item_id = ?').run(req.params.id);
+        await tx.execute({
+          sql: 'DELETE FROM user_pay_items WHERE item_id = ?',
+          args: [req.params.id]
+        });
         // Then delete the type
-        db.prepare('DELETE FROM pay_item_types WHERE id = ?').run(req.params.id);
-      })();
-      res.json({ success: true });
+        await tx.execute({
+          sql: 'DELETE FROM pay_item_types WHERE id = ?',
+          args: [req.params.id]
+        });
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
   });
 
-  app.post("/api/staff", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.post("/api/staff", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const { username, password, role, name, salary, payItems } = req.body;
-    const hashedPassword = bcrypt.hashSync(password, 10);
-    
     try {
-      db.transaction(() => {
-        const result = db.prepare('INSERT INTO users (username, password, role, name, salary) VALUES (?, ?, ?, ?, ?)').run(
-          username, hashedPassword, role, name, salary || 0
-        );
+      const hashedPassword = await bcrypt.hash(password, 10);
+      
+      const tx = await db.transaction('write');
+      try {
+        const result = await tx.execute({
+          sql: 'INSERT INTO users (username, password, role, name, salary) VALUES (?, ?, ?, ?, ?)',
+          args: [username, hashedPassword, role, name, salary || 0]
+        });
         const userId = result.lastInsertRowid;
 
         if (payItems && Array.isArray(payItems)) {
-          const insertItem = db.prepare('INSERT INTO user_pay_items (user_id, item_id, amount) VALUES (?, ?, ?)');
-          payItems.forEach((item: any) => {
-            insertItem.run(userId, item.itemId, item.amount);
-          });
+          for (const item of payItems) {
+            await tx.execute({
+              sql: 'INSERT INTO user_pay_items (user_id, item_id, amount) VALUES (?, ?, ?)',
+              args: [userId, item.itemId, item.amount]
+            });
+          }
         }
-      })();
-      res.json({ success: true });
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
     } catch (e: any) {
       console.error("Error adding staff:", e);
       if (e.message.includes('UNIQUE constraint failed: users.username')) {
@@ -755,61 +1098,94 @@ async function startServer() {
     }
   });
 
-  app.patch("/api/staff/:id", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.patch("/api/staff/:id", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const { role, name, salary, payItems } = req.body;
     
-    db.transaction(() => {
-      db.prepare('UPDATE users SET role = ?, name = ?, salary = ? WHERE id = ?').run(
-        role, name, salary, req.params.id
-      );
-
-      if (payItems && Array.isArray(payItems)) {
-        db.prepare('DELETE FROM user_pay_items WHERE user_id = ?').run(req.params.id);
-        const insertItem = db.prepare('INSERT INTO user_pay_items (user_id, item_id, amount) VALUES (?, ?, ?)');
-        payItems.forEach((item: any) => {
-          insertItem.run(req.params.id, item.itemId, item.amount);
+    try {
+      const tx = await db.transaction('write');
+      try {
+        await tx.execute({
+          sql: 'UPDATE users SET role = ?, name = ?, salary = ? WHERE id = ?',
+          args: [role, name, salary, req.params.id]
         });
+
+        if (payItems && Array.isArray(payItems)) {
+          await tx.execute({
+            sql: 'DELETE FROM user_pay_items WHERE user_id = ?',
+            args: [req.params.id]
+          });
+          for (const item of payItems) {
+            await tx.execute({
+              sql: 'INSERT INTO user_pay_items (user_id, item_id, amount) VALUES (?, ?, ?)',
+              args: [req.params.id, item.itemId, item.amount]
+            });
+          }
+        }
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
       }
-    })();
-    res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.delete("/api/staff/:id", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    db.prepare("UPDATE users SET status = 'inactive' WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
+  app.delete("/api/staff/:id", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      await db.execute({
+        sql: "UPDATE users SET status = 'inactive' WHERE id = ?",
+        args: [req.params.id]
+      });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // --- Payroll API ---
-  app.get("/api/payroll", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
-    const payroll = db.prepare(`
-      SELECT p.*, u.name as staff_name, u.role as staff_role
-      FROM payroll p
-      JOIN users u ON p.user_id = u.id
-      ORDER BY p.period_year DESC, p.period_month DESC
-    `).all();
-    res.json(payroll);
+  app.get("/api/payroll", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
+    try {
+      const payrollResult = await db.execute(`
+        SELECT p.*, u.name as staff_name, u.role as staff_role
+        FROM payroll p
+        JOIN users u ON p.user_id = u.id
+        ORDER BY p.period_year DESC, p.period_month DESC
+      `);
+      res.json(payrollResult.rows);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  app.post("/api/payroll/run", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.post("/api/payroll/run", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const { month, year } = req.body;
     
     try {
-      db.transaction(() => {
+      const tx = await db.transaction('write');
+      try {
         // Check if already run
-        const existing = db.prepare('SELECT id FROM payroll WHERE period_month = ? AND period_year = ? LIMIT 1').get(month, year);
-        if (existing) throw new Error("Payroll already run for this period");
+        const existingResult = await tx.execute({
+          sql: 'SELECT id FROM payroll WHERE period_month = ? AND period_year = ? LIMIT 1',
+          args: [month, year]
+        });
+        if (existingResult.rows.length > 0) throw new Error("Payroll already run for this period");
 
-        const staff = db.prepare("SELECT id, salary FROM users WHERE status = 'active'").all() as any[];
+        const staffResult = await tx.execute("SELECT id, salary FROM users WHERE status = 'active'");
+        const staff = staffResult.rows as any[];
         
-        const insert = db.prepare('INSERT INTO payroll (user_id, period_month, period_year, basic_salary, allowances, deductions, net_pay, breakdown) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-        
-        staff.forEach(s => {
-          const payItems = db.prepare(`
-            SELECT upi.amount, pit.name, pit.type 
-            FROM user_pay_items upi
-            JOIN pay_item_types pit ON upi.item_id = pit.id
-            WHERE upi.user_id = ?
-          `).all(s.id) as any[];
+        for (const s of staff) {
+          const payItemsResult = await tx.execute({
+            sql: `
+              SELECT upi.amount, pit.name, pit.type 
+              FROM user_pay_items upi
+              JOIN pay_item_types pit ON upi.item_id = pit.id
+              WHERE upi.user_id = ?
+            `,
+            args: [s.id]
+          });
+          const payItems = payItemsResult.rows as any[];
 
           let allowances = 0;
           let deductions = 0;
@@ -819,49 +1195,75 @@ async function startServer() {
           });
 
           const netPay = s.salary + allowances - deductions;
-          insert.run(s.id, month, year, s.salary, allowances, deductions, netPay, JSON.stringify(payItems));
-        });
-      })();
-      res.json({ success: true });
+          await tx.execute({
+            sql: 'INSERT INTO payroll (user_id, period_month, period_year, basic_salary, allowances, deductions, net_pay, breakdown) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            args: [s.id, month, year, s.salary, allowances, deductions, netPay, JSON.stringify(payItems)]
+          });
+        }
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
   });
 
-  app.delete("/api/payroll/record/:id", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.delete("/api/payroll/record/:id", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     try {
-      db.prepare('DELETE FROM payroll WHERE id = ?').run(req.params.id);
+      await db.execute({
+        sql: 'DELETE FROM payroll WHERE id = ?',
+        args: [req.params.id]
+      });
       res.json({ success: true });
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
   });
 
-  app.delete("/api/payroll/:month/:year", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.delete("/api/payroll/:month/:year", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     const { month, year } = req.params;
     try {
-      db.prepare('DELETE FROM payroll WHERE period_month = ? AND period_year = ?').run(month, year);
+      await db.execute({
+        sql: 'DELETE FROM payroll WHERE period_month = ? AND period_year = ?',
+        args: [month, year]
+      });
       res.json({ success: true });
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
   });
 
-  app.patch("/api/payroll/:id/approve", authenticateToken, authorize(['admin', 'manager']), (req, res) => {
+  app.patch("/api/payroll/:id/approve", authenticateToken, authorize(['admin', 'manager']), async (req, res) => {
     try {
-      db.transaction(() => {
-        const record = db.prepare('SELECT * FROM payroll WHERE id = ?').get(req.params.id) as any;
+      const tx = await db.transaction('write');
+      try {
+        const recordResult = await tx.execute({
+          sql: 'SELECT * FROM payroll WHERE id = ?',
+          args: [req.params.id]
+        });
+        const record = recordResult.rows[0] as any;
         if (!record || record.status !== 'pending') throw new Error("Invalid payroll record");
 
-        db.prepare("UPDATE payroll SET status = 'approved' WHERE id = ?").run(req.params.id);
+        await tx.execute({
+          sql: "UPDATE payroll SET status = 'approved' WHERE id = ?",
+          args: [req.params.id]
+        });
         
         // Add to expenses
         const userId = (req as any).user.id;
-        db.prepare('INSERT INTO expenses (amount, category, description, method, recorded_by) VALUES (?, ?, ?, ?, ?)').run(
-          record.net_pay, 'Payroll', `Payroll for ${record.period_month}/${record.period_year}`, 'Bank Transfer', userId
-        );
-      })();
-      res.json({ success: true });
+        await tx.execute({
+          sql: 'INSERT INTO expenses (amount, category, description, method, recorded_by) VALUES (?, ?, ?, ?, ?)',
+          args: [record.net_pay, 'Payroll', `Payroll for ${record.period_month}/${record.period_year}`, 'Bank Transfer', userId]
+        });
+        await tx.commit();
+        res.json({ success: true });
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
     } catch (e: any) {
       res.status(400).json({ message: e.message });
     }
@@ -892,4 +1294,4 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(console.error);
