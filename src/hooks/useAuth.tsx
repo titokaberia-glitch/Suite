@@ -18,16 +18,16 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>({
+    id: 1,
+    username: 'admin',
+    role: 'admin',
+    name: 'System Administrator'
+  });
+  const [token, setToken] = useState<string | null>('dummy-token');
 
   useEffect(() => {
-    const savedToken = localStorage.getItem('token');
-    const savedUser = localStorage.getItem('user');
-    if (savedToken && savedUser) {
-      setToken(savedToken);
-      setUser(JSON.parse(savedUser));
-    }
+    // Always authenticated
   }, []);
 
   const login = (token: string, user: User) => {

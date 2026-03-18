@@ -11,12 +11,6 @@ async function request(path: string, options: RequestInit = {}) {
   const response = await fetch(`${API_URL}${path}`, { ...options, headers });
   
   if (!response.ok) {
-    if (response.status === 401 && path !== '/auth/login') {
-      localStorage.removeItem('token');
-      localStorage.removeItem('user');
-      window.location.href = '/login';
-    }
-    
     let errorMessage = 'Something went wrong';
     try {
       const error = await response.json();
