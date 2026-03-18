@@ -1,5 +1,4 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import db, { initDb } from "./src/db";
@@ -11,24 +10,17 @@ dotenv.config();
 
 const JWT_SECRET = process.env.JWT_SECRET || "suitecontrol-secret-key";
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+const app = express();
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
-  app.use(express.json());
+app.use(express.json());
 
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", time: new Date().toISOString() });
-  });
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
 
-  try {
-    await initDb();
-  } catch (err) {
-    console.error('Failed to initialize database:', err);
-  }
-
-  // Seed admin if not exists
-  const seedAdmin = async () => {
+// Seed admin if not exists
+const seedAdmin = async () => {
     const adminResult = await db.execute({
       sql: 'SELECT * FROM users WHERE username = ?',
       args: ['admin']
@@ -142,13 +134,17 @@ async function startServer() {
     console.log(`Seeded ${insertedCount} new inventory items.`);
   };
 
+// Initialize DB and seed asynchronously
+(async () => {
   try {
+    await initDb();
     await seedAdmin();
     await seedRooms();
     await seedInventory();
   } catch (err) {
-    console.error('Failed to seed data:', err);
+    console.error('Failed to initialize database or seed data:', err);
   }
+})();
 
   // --- Auth Middleware ---
   const authenticateToken = (req: any, res: any, next: any) => {
@@ -1271,13 +1267,19 @@ async function startServer() {
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    // Serve static files from dist in production
+    (async () => {
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+      app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+      });
+    })();
+  } else if (!process.env.VERCEL) {
+    // Serve static files from dist in production (if not on Vercel)
     const distPath = path.resolve(process.cwd(), "dist");
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
@@ -1287,11 +1289,9 @@ async function startServer() {
     } else {
       console.error("Production build not found in dist directory. Please run 'npm run build'.");
     }
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
-}
-
-startServer().catch(console.error);
+export default app;
